@@ -1,0 +1,402 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 LlamaIndex Inc.
+
+from __future__ import annotations
+
+import json
+import time
+from typing import get_args
+
+import pytest
+from pydantic import TypeAdapter
+from workflows.context.serializers import JsonSerializer
+from workflows.events import (
+    Event,
+    StartEvent,
+    StopEvent,
+    UnreconstructedException,
+    _deserialize_event,
+    _deserialize_event_type,
+    _deserialize_exception,
+    _serialize_event,
+    _serialize_event_type,
+    _serialize_exception,
+)
+from workflows.runtime.types.results import (
+    AddCollectedEvent,
+    AddWaiter,
+    DeleteCollectedEvent,
+    DeleteWaiter,
+    StepWorkerFailed,
+    StepWorkerResult,
+)
+from workflows.runtime.types.step_id import StepId
+from workflows.runtime.types.ticks import (
+    _WORKFLOW_TICK_TYPES,
+    TickAddEvent,
+    TickCancelRun,
+    TickPublishEvent,
+    TickSessionStart,
+    TickStepResult,
+    TickTimeout,
+    TickWaiterTimeout,
+    TickWakeup,
+    WorkflowTick,
+    WorkflowTickAdapter,
+)
+
+
+class MyEvent(Event):
+    value: str = "hello"
+
+
+def test_step_id_root_stringifies_as_bare_step_name() -> None:
+    step_id = StepId.root("my_step")
+
+    assert str(step_id) == "my_step"
+
+    adapter = TypeAdapter(StepId)
+    assert adapter.dump_python(step_id, mode="json") == "my_step"
+    assert adapter.validate_python("my_step") == step_id
+
+
+def test_step_id_accepts_forward_namespaced_string_shape() -> None:
+    step_id = StepId.from_str("parent/child/process")
+
+    assert step_id.namespace == ("parent", "child")
+    assert step_id.name == "process"
+    assert str(step_id) == "parent/child/process"
+
+
+def test_root_step_id_tick_serializes_step_id_as_bare_name() -> None:
+    tick = TickStepResult(
+        step_id=StepId.root("process"),
+        worker_id=42,
+        invocation_id="worker-42",
+        event=MyEvent(value="trigger"),
+        result=[StepWorkerResult(result=StopEvent(result="done"))],
+    )
+
+    serialized = tick.model_dump(mode="json")
+
+    assert serialized["step_id"] == "process"
+    assert "step_name" not in serialized
+
+
+def test_legacy_step_name_tick_payloads_deserialize_to_root_step_ids() -> None:
+    add_event_payload = TickAddEvent(
+        event=StartEvent(), step_id=StepId.root("start")
+    ).model_dump(mode="json")
+    add_event_payload["step_name"] = add_event_payload.pop("step_id")
+    add_event = WorkflowTickAdapter.validate_python(add_event_payload)
+    assert isinstance(add_event, TickAddEvent)
+    assert add_event.step_id == StepId.root("start")
+
+    step_result_payload = TickStepResult(
+        step_id=StepId.root("process"),
+        worker_id=1,
+        invocation_id="worker-1",
+        event=StartEvent(),
+        result=[StepWorkerResult(result=None)],
+    ).model_dump(mode="json")
+    step_result_payload["step_name"] = step_result_payload.pop("step_id")
+    step_result = WorkflowTickAdapter.validate_python(step_result_payload)
+    assert isinstance(step_result, TickStepResult)
+    assert step_result.step_id == StepId.root("process")
+
+    waiter_payload = TickWaiterTimeout(
+        step_id=StepId.root("waiter"), waiter_id="w-1"
+    ).model_dump(mode="json")
+    waiter_payload["step_name"] = waiter_payload.pop("step_id")
+    waiter = WorkflowTickAdapter.validate_python(waiter_payload)
+    assert isinstance(waiter, TickWaiterTimeout)
+    assert waiter.step_id == StepId.root("waiter")
+
+
+# -- Serialization helper roundtrip tests --
+
+
+def test_event_roundtrip() -> None:
+    event = MyEvent(value="world")
+    serialized = _serialize_event(event)
+    result = _deserialize_event(serialized)
+    assert isinstance(result, MyEvent)
+    assert result.value == "world"
+
+
+def test_exception_roundtrip() -> None:
+    exc = ValueError("something went wrong")
+    serialized = _serialize_exception(exc)
+    result = _deserialize_exception(serialized)
+    assert isinstance(result, ValueError)
+    assert str(result) == "something went wrong"
+
+
+def test_exception_roundtrip_unimportable() -> None:
+    CustomError = type("CustomError", (Exception,), {})
+    exc = CustomError("oops")
+    serialized = _serialize_exception(exc)
+    result = _deserialize_exception(serialized)
+    assert isinstance(result, UnreconstructedException)
+    assert result.original_type == serialized["exception_type"]
+    assert str(result) == "oops"
+
+
+def test_event_type_roundtrip() -> None:
+    serialized = _serialize_event_type(MyEvent)
+    result = _deserialize_event_type(serialized)
+    assert result is MyEvent
+
+
+# -- Tick roundtrip tests --
+
+
+@pytest.mark.parametrize(
+    "tick",
+    [
+        pytest.param(
+            TickAddEvent(
+                event=StartEvent(),
+                step_id=StepId.root("my_step"),
+                attempts=3,
+                first_attempt_at=1234567890.0,
+                stamped_at=1234567891.0,
+            ),
+            id="add_event",
+        ),
+        pytest.param(
+            TickPublishEvent(event=MyEvent(value="world")),
+            id="publish_event",
+        ),
+        pytest.param(
+            TickCancelRun(),
+            id="cancel_run",
+        ),
+        pytest.param(
+            TickSessionStart(stamped_at=1234567890.0),
+            id="session_start",
+        ),
+        pytest.param(
+            TickTimeout(timeout=30.5, stamped_at=1234567892.0),
+            id="timeout",
+        ),
+        pytest.param(
+            TickWakeup(due=12345.5, stamped_at=1234567893.0),
+            id="wakeup",
+        ),
+        pytest.param(
+            TickWaiterTimeout(
+                step_id=StepId.root("waiter"),
+                waiter_id="w-1",
+                stamped_at=1234567894.0,
+            ),
+            id="waiter_timeout",
+        ),
+        pytest.param(
+            TickStepResult(
+                step_id=StepId.root("process"),
+                worker_id=42,
+                invocation_id="worker-42",
+                event=MyEvent(value="trigger"),
+                stamped_at=1234567890.0,
+                result=[StepWorkerResult(result=StopEvent(result="done"))],
+            ),
+            id="step_result_with_event",
+        ),
+        pytest.param(
+            TickStepResult(
+                step_id=StepId.root("process"),
+                worker_id=1,
+                invocation_id="worker-1",
+                event=StartEvent(),
+                result=[StepWorkerResult(result=None)],
+            ),
+            id="step_result_with_none",
+        ),
+        pytest.param(
+            TickStepResult(
+                step_id=StepId.root("collector"),
+                worker_id=2,
+                invocation_id="worker-2",
+                event=StartEvent(),
+                result=[
+                    AddCollectedEvent(
+                        event_id="evt-1", event=MyEvent(value="collected")
+                    )
+                ],
+            ),
+            id="step_result_add_collected_event",
+        ),
+        pytest.param(
+            TickStepResult(
+                step_id=StepId.root("collector"),
+                worker_id=3,
+                invocation_id="worker-3",
+                event=StartEvent(),
+                result=[DeleteCollectedEvent(event_id="evt-2")],
+            ),
+            id="step_result_delete_collected_event",
+        ),
+        pytest.param(
+            TickStepResult(
+                step_id=StepId.root("cleanup"),
+                worker_id=5,
+                invocation_id="worker-5",
+                event=StartEvent(),
+                result=[DeleteWaiter(waiter_id="w-2")],
+            ),
+            id="step_result_delete_waiter",
+        ),
+    ],
+)
+def test_tick_roundtrip(tick: WorkflowTick) -> None:
+    serialized = tick.model_dump(mode="json")
+    roundtripped = json.loads(json.dumps(serialized))
+    result = type(tick).model_validate(roundtripped)
+    assert result == tick
+
+
+# -- Tick roundtrip tests with lossy serialization --
+
+
+def test_tick_step_result_with_failed_value_error() -> None:
+    failed_at = time.time()
+    tick = TickStepResult(
+        step_id=StepId.root("broken_step"),
+        worker_id=7,
+        invocation_id="worker-7",
+        event=StartEvent(),
+        result=[
+            StepWorkerFailed(
+                exception=ValueError("something went wrong"), failed_at=failed_at
+            )
+        ],
+    )
+    serialized = tick.model_dump(mode="json")
+    roundtripped = json.loads(json.dumps(serialized))
+    result = TickStepResult.model_validate(roundtripped)
+
+    assert isinstance(result, TickStepResult)
+    r = result.result[0]
+    assert isinstance(r, StepWorkerFailed)
+    assert isinstance(r.exception, ValueError)
+    assert str(r.exception) == "something went wrong"
+    assert r.failed_at == failed_at
+
+
+def test_tick_step_result_with_failed_unimportable_exception() -> None:
+    CustomError = type("CustomError", (Exception,), {})
+    failed_at = time.time()
+    tick = TickStepResult(
+        step_id=StepId.root("broken_step"),
+        worker_id=8,
+        invocation_id="worker-8",
+        event=StartEvent(),
+        result=[StepWorkerFailed(exception=CustomError("oops"), failed_at=failed_at)],
+    )
+    serialized = tick.model_dump(mode="json")
+    roundtripped = json.loads(json.dumps(serialized))
+    result = TickStepResult.model_validate(roundtripped)
+
+    assert isinstance(result, TickStepResult)
+    r = result.result[0]
+    assert isinstance(r, StepWorkerFailed)
+    assert isinstance(r.exception, UnreconstructedException)
+    assert str(r.exception) == "oops"
+    assert r.failed_at == failed_at
+
+
+def test_tick_step_result_with_add_waiter() -> None:
+    tick = TickStepResult(
+        step_id=StepId.root("waiter_step"),
+        worker_id=4,
+        invocation_id="worker-4",
+        event=StartEvent(),
+        result=[
+            AddWaiter(
+                waiter_id="w-1",
+                waiter_event=MyEvent(value="waiting"),
+                requirements={"key": "value"},
+                timeout=60.0,
+                event_type=MyEvent,
+            )
+        ],
+    )
+    serialized = tick.model_dump(mode="json")
+
+    # Verify the serialized form captures has_requirements correctly
+    waiter_data = serialized["result"][0]
+    assert waiter_data["has_requirements"] is True
+    assert waiter_data["requirements"] == {}
+
+    roundtripped = json.loads(json.dumps(serialized))
+    result = TickStepResult.model_validate(roundtripped)
+
+    assert isinstance(result, TickStepResult)
+    r = result.result[0]
+    assert isinstance(r, AddWaiter)
+    assert r.waiter_id == "w-1"
+    assert isinstance(r.waiter_event, MyEvent)
+    assert r.waiter_event.value == "waiting"
+    # Requirements are always {} after deserialization
+    assert r.requirements == {}
+    assert r.timeout == 60.0
+    assert r.event_type is MyEvent
+
+
+# -- WorkflowTick discriminated union tests --
+
+
+def test_persisted_tick_roots_match_workflow_tick_union() -> None:
+    tick_union = get_args(WorkflowTick)[0]
+    assert set(_WORKFLOW_TICK_TYPES) == set(get_args(tick_union))
+
+
+def test_allowlisted_serializer_roundtrips_framework_tick() -> None:
+    serializer = JsonSerializer(allowed_types=[])
+    tick = TickCancelRun()
+
+    assert serializer.deserialize(serializer.serialize(tick)) == tick
+
+
+def test_allowlisted_serializer_roundtrips_tick_with_user_event() -> None:
+    serializer = JsonSerializer(allowed_types=[MyEvent])
+    tick = TickAddEvent(event=MyEvent(value="allowed"))
+
+    restored = serializer.deserialize(serializer.serialize(tick))
+
+    assert restored == tick
+    assert type(restored.event) is MyEvent
+
+
+def test_allowlisted_serializer_rejects_user_type_inside_tick() -> None:
+    serializer = JsonSerializer(allowed_types=[])
+    tick = TickAddEvent(event=MyEvent(value="blocked"))
+
+    with pytest.raises(ValueError, match="not in the serializer's allowed types"):
+        serializer.deserialize(serializer.serialize(tick))
+
+
+def test_workflow_tick_discriminated_union_roundtrip() -> None:
+    """Verify that WorkflowTick TypeAdapter can roundtrip all tick types."""
+    adapter = TypeAdapter(WorkflowTick)
+
+    ticks = [
+        TickAddEvent(event=StartEvent(), step_id=StepId.root("s")),
+        TickPublishEvent(event=MyEvent(value="x")),
+        TickCancelRun(),
+        TickSessionStart(stamped_at=123.0),
+        TickTimeout(timeout=10.0),
+        TickStepResult(
+            step_id=StepId.root("s"),
+            worker_id=0,
+            invocation_id="worker-0",
+            event=StartEvent(),
+            result=[StepWorkerResult(result=None)],
+        ),
+    ]
+    for tick in ticks:
+        dumped = adapter.dump_python(tick, mode="json")
+        roundtripped = json.loads(json.dumps(dumped))
+        restored = adapter.validate_python(roundtripped)
+        assert type(restored) is type(tick)
